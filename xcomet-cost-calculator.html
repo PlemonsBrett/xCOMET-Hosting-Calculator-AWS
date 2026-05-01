@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>xCOMET Inference Cost Model</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: #0a0e14; }
+    body { font-family: 'Geist', 'Inter', system-ui, sans-serif; color: #e6e9ef; }
+    .mono { font-family: 'Geist Mono', 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+    input[type="range"] {
+      -webkit-appearance: none; appearance: none;
+      background: transparent; width: 100%;
+    }
+    input[type="range"]::-webkit-slider-track { height: 3px; background: #1f2733; border-radius: 2px; }
+    input[type="range"]::-moz-range-track { height: 3px; background: #1f2733; border-radius: 2px; }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px; height: 16px;
+      background: #f5b754; border-radius: 50%;
+      cursor: pointer; margin-top: -6.5px;
+      box-shadow: 0 0 0 4px rgba(245,183,84,0.15);
+    }
+    input[type="range"]::-moz-range-thumb {
+      width: 16px; height: 16px;
+      background: #f5b754; border-radius: 50%;
+      cursor: pointer; border: none;
+      box-shadow: 0 0 0 4px rgba(245,183,84,0.15);
+    }
+    .chip {
+      padding: 6px 12px; border-radius: 6px;
+      font-size: 12px; font-weight: 500;
+      cursor: pointer; transition: all 0.15s;
+      border: 1px solid #1f2733;
+      background: #131820; color: #8b949e;
+      font-family: inherit;
+    }
+    .chip:hover { border-color: #2d3744; color: #e6e9ef; }
+    .chip.active {
+      background: rgba(245,183,84,0.12);
+      border-color: #f5b754;
+      color: #f5b754;
+    }
+    .row:hover { background: rgba(255,255,255,0.02); }
+    .bar-fill { transition: width 0.3s ease; }
+    #root { min-height: 100vh; }
+    /* Loading state */
+    .loader {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: #0a0e14; color: #8b949e;
+      font-family: 'Geist Mono', monospace; font-size: 12px;
+      letter-spacing: 0.1em;
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="loader">LOADING COST MODEL...</div>
+  </div>
+
+  <script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+
+// ============================================================================
+// PRICING DATA — us-east-1, on-demand, sourced April-May 2026
+// ============================================================================
+const PRICING = {
+  'ml.g5.xlarge':    { sm: 1.408,  ec2: 1.006,  gpu: '1× A10G 24GB' },
+  'ml.g5.2xlarge':   { sm: 1.515,  ec2: 1.212,  gpu: '1× A10G 24GB' },
+  'ml.g5.12xlarge':  { sm: 7.090,  ec2: 5.672,  gpu: '4× A10G 96GB' },
+  'ml.g5.24xlarge':  { sm: 10.18,  ec2: 8.144,  gpu: '4× A10G 96GB' },
+  'ml.g6.xlarge':    { sm: 1.127,  ec2: 0.805,  gpu: '1× L4 24GB' },
+  'ml.g6.12xlarge':  { sm: 5.752,  ec2: 4.602,  gpu: '4× L4 96GB' },
+  'ml.g6e.2xlarge':  { sm: 2.802,  ec2: 2.242,  gpu: '1× L40S 48GB' },
+  'ml.g6e.12xlarge': { sm: 13.117, ec2: 10.493, gpu: '4× L40S 192GB' },
+  'ml.inf2.xlarge':  { sm: 0.948,  ec2: 0.758,  gpu: '1× Inferentia2 32GB' },
+  'ml.inf2.8xlarge': { sm: 2.460,  ec2: 1.968,  gpu: '2× Inferentia2 64GB' },
+  'ml.inf2.24xlarge':{ sm: 8.114,  ec2: 6.491,  gpu: '6× Inferentia2 192GB' },
+};
+
+const THROUGHPUT = {
+  XL: {
+    'ml.g5.xlarge':    100,
+    'ml.g5.2xlarge':   105,
+    'ml.g6.xlarge':    130,
+    'ml.g6e.2xlarge':  220,
+    'ml.g6e.12xlarge': 700,
+    'ml.inf2.xlarge':  90,
+  },
+  XXL: {
+    'ml.g5.12xlarge':  50,
+    'ml.g5.24xlarge':  65,
+    'ml.g6.12xlarge':  65,
+    'ml.g6e.12xlarge': 140,
+    'ml.inf2.8xlarge': 50,
+    'ml.inf2.24xlarge': 130,
+  },
+};
+
+const OPTIONS = [
+  { id: 'rt-g5', name: 'SageMaker Real-time', sub: 'g5 (A10G)', color: '#f85149',
+    XL: 'ml.g5.xlarge', XXL: 'ml.g5.12xlarge', mode: 'always-on', minHA: 2, pricing: 'sm',
+    when: 'QE in synchronous translation hot path' },
+  { id: 'async-g5', name: 'SageMaker Async', sub: 'g5 (A10G)', color: '#f5b754',
+    XL: 'ml.g5.xlarge', XXL: 'ml.g5.12xlarge', mode: 'pay-per-use', minHA: 0, pricing: 'sm',
+    when: 'QE attaches to segment lifecycle async' },
+  { id: 'batch-g5', name: 'SageMaker Batch Transform', sub: 'g5 (A10G)', color: '#56d364',
+    XL: 'ml.g5.xlarge', XXL: 'ml.g5.12xlarge', mode: 'pay-per-use', minHA: 0, pricing: 'sm',
+    when: 'Offline / retrospective scoring (audits, MQM)' },
+  { id: 'rt-inf2', name: 'SageMaker Real-time', sub: 'Inferentia2', color: '#5fb3d4',
+    XL: 'ml.inf2.xlarge', XXL: 'ml.inf2.8xlarge', mode: 'always-on', minHA: 2, pricing: 'sm',
+    when: 'Sync hot path, cost-optimized (Neuron compile reqd)' },
+  { id: 'async-inf2', name: 'SageMaker Async', sub: 'Inferentia2', color: '#7c9eff',
+    XL: 'ml.inf2.xlarge', XXL: 'ml.inf2.8xlarge', mode: 'pay-per-use', minHA: 0, pricing: 'sm',
+    when: 'Best $/segment async (Neuron compile reqd)' },
+  { id: 'ic-g6e', name: 'Inference Components', sub: 'g6e (L40S), shared', color: '#bb8fce',
+    XL: 'ml.g6e.12xlarge', XXL: 'ml.g6e.12xlarge', mode: 'always-on', minHA: 1, pricing: 'sm', sharedAcross: 3,
+    when: 'Co-host xCOMET + APE + other QE models' },
+  { id: 'eks-g5', name: 'EKS Self-managed', sub: 'g5 (A10G)', color: '#e09a3a',
+    XL: 'ml.g5.xlarge', XXL: 'ml.g5.12xlarge', mode: 'always-on', minHA: 2, pricing: 'ec2',
+    when: 'Co-locate w/ MT pipeline; +ops overhead not modeled' },
+];
+
+const HOURS_PER_MONTH = 730;
+
+function calcOption(opt, model, segPerMonth, peakRatio, savingsDiscount) {
+  const instance = model === 'XL' ? opt.XL : opt.XXL;
+  const price = PRICING[instance];
+  const tput = THROUGHPUT[model][instance];
+  if (!price || !tput) return null;
+
+  const baseHourly = opt.pricing === 'sm' ? price.sm : price.ec2;
+  const effHourly = baseHourly * (1 - savingsDiscount);
+
+  let instances, monthlyCost, gpuHours;
+
+  if (opt.mode === 'always-on') {
+    const peakSegPerSec = (segPerMonth / (HOURS_PER_MONTH * 3600)) * peakRatio;
+    instances = Math.max(opt.minHA, Math.ceil(peakSegPerSec / tput));
+    monthlyCost = instances * effHourly * HOURS_PER_MONTH;
+    gpuHours = instances * HOURS_PER_MONTH;
+    if (opt.sharedAcross) {
+      monthlyCost = monthlyCost / opt.sharedAcross;
+      gpuHours = gpuHours / opt.sharedAcross;
+    }
+  } else {
+    gpuHours = segPerMonth / tput / 3600;
+    instances = gpuHours / HOURS_PER_MONTH;
+    monthlyCost = gpuHours * effHourly;
+  }
+
+  return {
+    instance, gpu: price.gpu, hourlyRate: effHourly, baseHourly,
+    instances, gpuHours, monthlyCost,
+    costPerMillion: (monthlyCost / segPerMonth) * 1e6,
+    tput,
+  };
+}
+
+const fmt = (n) => {
+  if (n >= 1_000_000) return `$${(n/1_000_000).toFixed(2)}M`;
+  if (n >= 1000) return `$${(n/1000).toFixed(1)}k`;
+  if (n >= 100) return `$${n.toFixed(0)}`;
+  return `$${n.toFixed(2)}`;
+};
+
+const fmtN = (n) => {
+  if (n >= 1_000_000_000) return `${(n/1_000_000_000).toFixed(2)}B`;
+  if (n >= 1_000_000) return `${(n/1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n/1000).toFixed(0)}k`;
+  return n.toFixed(0);
+};
+
+const VOLUME_PRESETS = [
+  { label: 'Low',    value: 30_000_000 },
+  { label: 'Medium', value: 300_000_000 },
+  { label: 'High',   value: 1_500_000_000 },
+  { label: 'XL',     value: 5_000_000_000 },
+];
+
+const SAVINGS_PRESETS = [
+  { label: 'On-demand', value: 0 },
+  { label: '1-yr SP',   value: 0.36 },
+  { label: '3-yr SP',   value: 0.50 },
+];
+
+function CostCalc() {
+  const [model, setModel] = useState('XL');
+  const [segPerMonth, setSegPerMonth] = useState(300_000_000);
+  const [peakRatio, setPeakRatio] = useState(2.5);
+  const [savings, setSavings] = useState(0);
+  const [sortBy, setSortBy] = useState('cost');
+
+  const results = useMemo(() => {
+    return OPTIONS
+      .map(opt => ({ opt, calc: calcOption(opt, model, segPerMonth, peakRatio, savings) }))
+      .filter(r => r.calc !== null)
+      .sort((a, b) => {
+        if (sortBy === 'cost') return a.calc.monthlyCost - b.calc.monthlyCost;
+        if (sortBy === 'unit') return a.calc.costPerMillion - b.calc.costPerMillion;
+        return 0;
+      });
+  }, [model, segPerMonth, peakRatio, savings, sortBy]);
+
+  const maxCost = results.length > 0 ? Math.max(...results.map(r => r.calc.monthlyCost)) : 1;
+
+  return (
+    <div style={{ padding: '2rem 1.5rem' }}>
+      <div style={{ maxWidth: '1280px', margin: '0 auto' }}>
+        <div style={{ marginBottom: '2rem', borderBottom: '1px solid #1f2733', paddingBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '12px', marginBottom: '6px' }}>
+            <span className="mono" style={{ color: '#f5b754', fontSize: '11px', letterSpacing: '0.1em', fontWeight: 600 }}>
+              [PROPIO / TEAM VOX]
+            </span>
+            <span className="mono" style={{ color: '#4a5260', fontSize: '11px' }}>
+              v1.0 · us-east-1 · pricing as of 2026-05-01
+            </span>
+          </div>
+          <h1 style={{ margin: 0, fontSize: '28px', fontWeight: 600, letterSpacing: '-0.02em' }}>
+            xCOMET Inference Cost Model
+          </h1>
+          <p style={{ margin: '6px 0 0 0', color: '#8b949e', fontSize: '14px' }}>
+            Compare hosting options for xCOMET QE in the translation pipeline.
+            All numbers are estimates — validate throughput with a real benchmark before committing.
+          </p>
+        </div>
+
+        <div style={{
+          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+          gap: '1.5rem', marginBottom: '2rem',
+          background: '#131820', border: '1px solid #1f2733', borderRadius: '8px', padding: '1.5rem',
+        }}>
+          <div>
+            <label style={{ display: 'block', fontSize: '11px', color: '#8b949e', marginBottom: '8px', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+              Model variant
+            </label>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button className={`chip ${model === 'XL' ? 'active' : ''}`} onClick={() => setModel('XL')}>
+                xCOMET-XL · 3.5B
+              </button>
+              <button className={`chip ${model === 'XXL' ? 'active' : ''}`} onClick={() => setModel('XXL')}>
+                xCOMET-XXL · 10.7B
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label style={{ display: 'block', fontSize: '11px', color: '#8b949e', marginBottom: '8px', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+              Volume preset
+            </label>
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              {VOLUME_PRESETS.map(p => (
+                <button key={p.label}
+                  className={`chip ${segPerMonth === p.value ? 'active' : ''}`}
+                  onClick={() => setSegPerMonth(p.value)}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label style={{ display: 'block', fontSize: '11px', color: '#8b949e', marginBottom: '8px', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+              Pricing tier
+            </label>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              {SAVINGS_PRESETS.map(p => (
+                <button key={p.label}
+                  className={`chip ${savings === p.value ? 'active' : ''}`}
+                  onClick={() => setSavings(p.value)}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ gridColumn: '1 / -1', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', marginTop: '0.5rem' }}>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '8px' }}>
+                <label style={{ fontSize: '11px', color: '#8b949e', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                  Segments per month
+                </label>
+                <span className="mono" style={{ color: '#f5b754', fontSize: '14px', fontWeight: 600 }}>
+                  {fmtN(segPerMonth)} <span style={{ color: '#4a5260', fontWeight: 400 }}>/ {fmtN(segPerMonth/30)}/day</span>
+                </span>
+              </div>
+              <input type="range" min="6" max="10" step="0.05"
+                value={Math.log10(segPerMonth)}
+                onChange={(e) => setSegPerMonth(Math.round(Math.pow(10, parseFloat(e.target.value))))} />
+            </div>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '8px' }}>
+                <label style={{ fontSize: '11px', color: '#8b949e', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                  Peak-to-avg ratio (HA sizing)
+                </label>
+                <span className="mono" style={{ color: '#f5b754', fontSize: '14px', fontWeight: 600 }}>
+                  {peakRatio.toFixed(1)}×
+                </span>
+              </div>
+              <input type="range" min="1" max="6" step="0.1"
+                value={peakRatio}
+                onChange={(e) => setPeakRatio(parseFloat(e.target.value))} />
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
+          <div className="mono" style={{ fontSize: '11px', color: '#4a5260', letterSpacing: '0.1em' }}>
+            ━━━ {results.length} OPTIONS ━━━
+          </div>
+          <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+            <span style={{ fontSize: '11px', color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Sort by</span>
+            <button className={`chip ${sortBy === 'cost' ? 'active' : ''}`} onClick={() => setSortBy('cost')}>Monthly $</button>
+            <button className={`chip ${sortBy === 'unit' ? 'active' : ''}`} onClick={() => setSortBy('unit')}>$ / 1M segments</button>
+          </div>
+        </div>
+
+        <div style={{ background: '#131820', border: '1px solid #1f2733', borderRadius: '8px', overflow: 'hidden' }}>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '2.2fr 1.4fr 1fr 1fr 2fr 1.5fr',
+            padding: '12px 16px', fontSize: '10px', color: '#8b949e',
+            letterSpacing: '0.08em', textTransform: 'uppercase',
+            borderBottom: '1px solid #1f2733', background: '#0d1218',
+          }}>
+            <div>Option</div>
+            <div>Instance</div>
+            <div style={{ textAlign: 'right' }}>Capacity</div>
+            <div style={{ textAlign: 'right' }}>$ / 1M seg</div>
+            <div style={{ textAlign: 'right' }}>$ / month</div>
+            <div></div>
+          </div>
+
+          {results.map(({ opt, calc }, idx) => {
+            const widthPct = (calc.monthlyCost / maxCost) * 100;
+            const isCheapest = idx === 0 && sortBy === 'cost';
+            return (
+              <div key={opt.id} className="row" style={{
+                display: 'grid', gridTemplateColumns: '2.2fr 1.4fr 1fr 1fr 2fr 1.5fr',
+                padding: '14px 16px',
+                borderBottom: idx === results.length - 1 ? 'none' : '1px solid #1f2733',
+                fontSize: '13px', alignItems: 'center', position: 'relative',
+              }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <div style={{ width: '3px', height: '20px', background: opt.color, borderRadius: '2px' }} />
+                    <div>
+                      <div style={{ fontWeight: 500 }}>
+                        {opt.name}
+                        {isCheapest && (
+                          <span className="mono" style={{
+                            marginLeft: '8px', fontSize: '9px', color: '#56d364',
+                            border: '1px solid #56d364', padding: '1px 5px',
+                            borderRadius: '3px', letterSpacing: '0.05em',
+                          }}>CHEAPEST</span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#4a5260', marginTop: '2px' }}>{opt.sub}</div>
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <div className="mono" style={{ fontSize: '12px', color: '#e6e9ef' }}>{calc.instance.replace('ml.', '')}</div>
+                  <div style={{ fontSize: '10px', color: '#4a5260', marginTop: '2px' }}>{calc.gpu}</div>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  {opt.mode === 'always-on' ? (
+                    <>
+                      <div className="mono" style={{ fontSize: '13px' }}>
+                        {opt.sharedAcross ? `${(calc.instances).toFixed(0)}×` : `${calc.instances}×`}
+                      </div>
+                      <div style={{ fontSize: '10px', color: '#4a5260', marginTop: '2px' }}>
+                        {opt.sharedAcross ? `÷${opt.sharedAcross} models` : 'instances'}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="mono" style={{ fontSize: '13px' }}>{fmtN(calc.gpuHours)}h</div>
+                      <div style={{ fontSize: '10px', color: '#4a5260', marginTop: '2px' }}>GPU-hrs/mo</div>
+                    </>
+                  )}
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div className="mono" style={{ fontSize: '13px', color: '#e6e9ef' }}>
+                    ${calc.costPerMillion.toFixed(2)}
+                  </div>
+                </div>
+                <div style={{ textAlign: 'right', position: 'relative' }}>
+                  <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', paddingRight: '12px' }}>
+                    <div style={{ width: '100%', height: '24px', background: '#0d1218', borderRadius: '3px', position: 'relative', overflow: 'hidden' }}>
+                      <div className="bar-fill" style={{
+                        width: `${widthPct}%`, height: '100%',
+                        background: `linear-gradient(90deg, ${opt.color}33, ${opt.color}66)`,
+                        borderRight: `2px solid ${opt.color}`,
+                      }} />
+                    </div>
+                  </div>
+                  <div className="mono" style={{
+                    position: 'relative', fontSize: '14px', fontWeight: 600,
+                    paddingRight: '8px', color: '#e6e9ef',
+                    textShadow: '0 0 8px rgba(10,14,20,0.9)',
+                  }}>
+                    {fmt(calc.monthlyCost)}
+                  </div>
+                </div>
+                <div style={{ fontSize: '11px', color: '#8b949e', paddingLeft: '12px', lineHeight: 1.4 }}>
+                  {opt.when}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{
+          marginTop: '2rem', padding: '1.25rem',
+          background: '#0d1218', border: '1px solid #1f2733', borderRadius: '8px',
+          fontSize: '12px', color: '#8b949e', lineHeight: 1.6,
+        }}>
+          <div className="mono" style={{ color: '#f5b754', fontSize: '11px', letterSpacing: '0.1em', marginBottom: '10px' }}>
+            ━━━ ASSUMPTIONS &amp; CAVEATS ━━━
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem' }}>
+            <div>
+              <strong style={{ color: '#e6e9ef' }}>Throughput</strong> — XL: ~100 seg/s on g5.xlarge,
+              ~700 seg/s on g6e.12xlarge. XXL: ~50 seg/s on g5.12xlarge, ~140 on g6e.12xlarge.
+              Conservative estimates based on XLM-R encoder family. Real benchmarks could swing ±50%.
+            </div>
+            <div>
+              <strong style={{ color: '#e6e9ef' }}>Pricing</strong> — us-east-1, on-demand, May 2026.
+              SageMaker premium ~25–40% over EC2. Inferentia2 SageMaker pricing estimated from
+              EC2 inf2 + SM premium. Savings Plans: 1-yr ~36%, 3-yr ~50% (no upfront, all-instance).
+            </div>
+            <div>
+              <strong style={{ color: '#e6e9ef' }}>HA sizing</strong> — Always-on options size to
+              <span className="mono"> ceil(peak_seg_per_sec / instance_throughput)</span>, with
+              minimum 2 for HA. Pay-per-use options bill actual GPU-hours only — no idle cost.
+            </div>
+            <div>
+              <strong style={{ color: '#e6e9ef' }}>Inference Components</strong> — assumes xCOMET
+              co-hosted with 2 other models on a single g6e.12xlarge, splitting cost 3 ways.
+              Real allocation depends on per-model concurrency.
+            </div>
+          </div>
+        </div>
+
+        <div style={{ marginTop: '1.5rem', fontSize: '11px', color: '#4a5260', textAlign: 'center' }} className="mono">
+          ALL NUMBERS ARE ESTIMATES · BENCHMARK BEFORE COMMITTING · NOT INVESTMENT ADVICE
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<CostCalc />);
+  </script>
+</body>
+</html>
